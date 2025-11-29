@@ -202,6 +202,46 @@ func (cli *Client) parseMsgMetaInfo(node waBinary.Node) (metaInfo types.MsgMetaI
 	return
 }
 
+// === MODIFICAÇÃO: Adicionar parsing de nós business ===
+func (cli *Client) parseMsgBusinessInfo(node waBinary.Node) (businessInfo types.MsgBusinessInfo, err error) {
+	bizNode := node.GetChildByTag("biz")
+	if bizNode.Tag == "" {
+		return businessInfo, nil
+	}
+
+	// Processar conteúdo do nó biz
+	for _, child := range bizNode.GetChildren() {
+		switch child.Tag {
+		case "buttons", "buttons_response":
+			businessInfo.ButtonType = child.Tag
+			businessInfo.ButtonAttrs = child.Attrs
+		case "list", "list_response":
+			businessInfo.ButtonType = child.Tag
+			businessInfo.ButtonAttrs = child.Attrs
+		case "interactive_response":
+			businessInfo.ButtonType = child.Tag
+			businessInfo.ButtonAttrs = child.Attrs
+		case "template":
+			businessInfo.ButtonType = child.Tag
+			businessInfo.ButtonAttrs = child.Attrs
+		case "interactive":
+			// Processar mensagens interativas nativas
+			interactiveAG := child.AttrGetter()
+			businessInfo.InteractiveType = interactiveAG.String("type")
+			businessInfo.InteractiveVersion = interactiveAG.String("v")
+			
+			// Processar native_flow dentro de interactive
+			nativeFlow := child.GetChildByTag("native_flow")
+			if nativeFlow.Tag != "" {
+				nativeAG := nativeFlow.AttrGetter()
+				businessInfo.NativeFlowName = nativeAG.String("name")
+			}
+		}
+	}
+
+	return businessInfo, nil
+}
+
 func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, error) {
 	var info types.MessageInfo
 	var err error
@@ -239,6 +279,14 @@ func (cli *Client) parseMessageInfo(node *waBinary.Node) (*types.MessageInfo, er
 			info.MsgMetaInfo, err = cli.parseMsgMetaInfo(child)
 			if err != nil {
 				cli.Log.Warnf("Failed to parse <meta> node in %s: %v", info.ID, err)
+			}
+		// === MODIFICAÇÃO: Adicionar parsing de nós business ===
+		case "biz":
+			info.MsgBusinessInfo, err = cli.parseMsgBusinessInfo(child)
+			if err != nil {
+				cli.Log.Warnf("Failed to parse <biz> node in %s: %v", info.ID, err)
+			} else {
+				cli.Log.Debugf("Parsed business node with button type: %s", info.MsgBusinessInfo.ButtonType)
 			}
 		case "franking":
 			// TODO
@@ -1023,7 +1071,25 @@ func (cli *Client) handleDecryptedMessage(ctx context.Context, info *types.Messa
 	if !ok {
 		return false
 	}
-	evt := &events.Message{Info: *info, RawMessage: msg, RetryCount: retryCount}
+	
+	// === MODIFICAÇÃO: Adicionar informações de business ao evento ===
+	evt := &events.Message{
+		Info:       *info,
+		RawMessage: msg,
+		RetryCount: retryCount,
+	}
+	
+	// Adicionar informações de botões business se disponíveis
+	if info.MsgBusinessInfo.ButtonType != "" {
+		evt.BusinessInfo = &events.BusinessMessageInfo{
+			ButtonType:         info.MsgBusinessInfo.ButtonType,
+			ButtonAttrs:        info.MsgBusinessInfo.ButtonAttrs,
+			InteractiveType:    info.MsgBusinessInfo.InteractiveType,
+			InteractiveVersion: info.MsgBusinessInfo.InteractiveVersion,
+			NativeFlowName:     info.MsgBusinessInfo.NativeFlowName,
+		}
+	}
+	
 	return cli.dispatchEvent(evt.UnwrapRaw())
 }
 
