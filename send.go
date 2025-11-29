@@ -156,6 +156,8 @@ type SendRequestExtra struct {
 	Meta *types.MsgMetaInfo
 	// use this only if you know what you are doing
 	AdditionalNodes *[]waBinary.Node
+	// BusinessNodes allows adding additional business nodes (like bot nodes) to the message.
+	BusinessNodes *[]waBinary.Node
 }
 
 // SendMessage sends the given message.
@@ -233,6 +235,11 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	isBotMode := isInlineBotMode || to.IsBot()
 	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message)
 	var extraParams nodeExtraParams
+
+	// Adicionar BusinessNodes aos extraParams
+	if req.BusinessNodes != nil {
+		extraParams.businessNodes = req.BusinessNodes
+	}
 
 	if needsMessageSecret {
 		if message.MessageContextInfo == nil {
@@ -728,6 +735,7 @@ type nodeExtraParams struct {
 	botNode         *waBinary.Node
 	metaNode        *waBinary.Node
 	additionalNodes *[]waBinary.Node
+	businessNodes   *[]waBinary.Node
 	addressingMode  types.AddressingMode
 }
 
@@ -954,6 +962,11 @@ func getMediaTypeFromMessage(msg *waE2E.Message) string {
 	}
 }
 
+// Função auxiliar para verificar se é newsletter
+func isNewsletter(jid types.JID) bool {
+	return jid.Server == types.NewsletterServer
+}
+
 func getButtonTypeFromMessage(msg *waE2E.Message) string {
 	switch {
 	case msg.ViewOnceMessage != nil:
@@ -972,6 +985,8 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 		return "list_response"
 	case msg.InteractiveResponseMessage != nil:
 		return "interactive_response"
+	case msg.TemplateMessage != nil:
+		return "template"
 	default:
 		return ""
 	}
@@ -986,11 +1001,25 @@ func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
 	case msg.EphemeralMessage != nil:
 		return getButtonAttributes(msg.EphemeralMessage.Message)
 	case msg.TemplateMessage != nil:
+		// TODO: Add template message attributes
 		return waBinary.Attrs{}
 	case msg.ListMessage != nil:
+		listType := msg.ListMessage.GetListType()
+		if listType == 0 {
+			// Force SINGLE_SELECT como no código JavaScript
+			listType = waE2E.ListMessage_SINGLE_SELECT
+		}
 		return waBinary.Attrs{
 			"v":    "2",
-			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
+			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(listType)]),
+		}
+	case msg.ButtonsMessage != nil:
+		return waBinary.Attrs{
+			"v": "2",
+		}
+	case msg.InteractiveResponseMessage != nil:
+		return waBinary.Attrs{
+			"v": "2",
 		}
 	default:
 		return waBinary.Attrs{}
@@ -1110,15 +1139,47 @@ func (cli *Client) getMessageContent(
 		content = append(content, *extraParams.additionalNodes...)
 	}
 
-	if buttonType := getButtonTypeFromMessage(message); buttonType != "" {
-		content = append(content, waBinary.Node{
+	// Adicionar business nodes do SendRequestExtra
+	if extraParams.businessNodes != nil {
+		content = append(content, *extraParams.businessNodes...)
+	}
+
+	// === MODIFICAÇÃO: Adicionar suporte a botões business ===
+	buttonType := getButtonTypeFromMessage(message)
+	if buttonType != "" {
+		bizNode := waBinary.Node{
 			Tag: "biz",
 			Content: []waBinary.Node{{
 				Tag:   buttonType,
 				Attrs: getButtonAttributes(message),
 			}},
-		})
+		}
+		content = append(content, bizNode)
+		cli.Log.Debugf("Adding business node for button type: %s", buttonType)
 	}
+
+	// === MODIFICAÇÃO ADICIONAL: Suporte a mensagens interativas nativas ===
+	toJID, _ := types.ParseJID(msgAttrs["to"])
+	if !isNewsletter(toJID) && (getMediaTypeFromMessage(message) == "interactiveMessage" || buttonType == "buttons") {
+		nativeNode := waBinary.Node{
+			Tag: "biz",
+			Content: []waBinary.Node{{
+				Tag: "interactive",
+				Attrs: waBinary.Attrs{
+					"type": "native_flow",
+					"v":    "1",
+				},
+				Content: []waBinary.Node{{
+					Tag: "native_flow",
+					Attrs: waBinary.Attrs{
+						"name": "quick_reply",
+					},
+				}},
+			}},
+		}
+		content = append(content, nativeNode)
+	}
+
 	return content
 }
 
@@ -1156,12 +1217,35 @@ func (cli *Client) prepareMessageNode(
 		"type": msgType,
 		"to":   to,
 	}
+
+	// === MODIFICAÇÃO: Adicionar atributos de edição para botões ===
+	if message.ProtocolMessage != nil && message.ProtocolMessage.GetType() == waE2E.ProtocolMessage_REVOKE {
+		// Para mensagens de revogação (delete)
+		if to.Server == types.GroupServer && !message.ProtocolMessage.GetKey().GetFromMe() {
+			attrs["edit"] = "8" // Admin revoke
+		} else {
+			attrs["edit"] = "7" // Sender revoke
+		}
+	} else if message.EditedMessage != nil {
+		// Para mensagens editadas
+		if to.Server == types.NewsletterServer {
+			attrs["edit"] = "3"
+		} else {
+			attrs["edit"] = "1"
+		}
+	} else if getButtonTypeFromMessage(message) == "buttons" && message.ButtonsMessage != nil {
+		// Para mensagens com botões que precisam de pin
+		attrs["edit"] = "2"
+	}
+
 	// TODO this is a very hacky hack for announcement group messages, why is it pn anyway?
 	if extraParams.addressingMode != "" {
 		attrs["addressing_mode"] = string(extraParams.addressingMode)
 	}
 	if editAttr := getEditAttribute(message); editAttr != "" {
-		attrs["edit"] = string(editAttr)
+		if attrs["edit"] == "" {
+			attrs["edit"] = string(editAttr)
+		}
 		encAttrs["decrypt-fail"] = string(events.DecryptFailHide)
 	}
 	if msgType == "reaction" || message.GetPollUpdateMessage() != nil {
